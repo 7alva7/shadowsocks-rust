@@ -12,14 +12,11 @@ use std::{
     vec,
 };
 
-use bytes::{BufMut, BytesMut};
+use bytes::{Buf, BufMut, BytesMut};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 pub use self::consts::{
-    SOCKS5_AUTH_METHOD_GSSAPI,
-    SOCKS5_AUTH_METHOD_NONE,
-    SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE,
-    SOCKS5_AUTH_METHOD_PASSWORD,
+    SOCKS5_AUTH_METHOD_GSSAPI, SOCKS5_AUTH_METHOD_NONE, SOCKS5_AUTH_METHOD_NOT_ACCEPTABLE, SOCKS5_AUTH_METHOD_PASSWORD,
 };
 
 #[rustfmt::skip]
@@ -148,7 +145,7 @@ impl fmt::Display for Reply {
             Reply::GeneralFailure          => write!(f, "General failure"),
             Reply::HostUnreachable         => write!(f, "Host unreachable"),
             Reply::NetworkUnreachable      => write!(f, "Network unreachable"),
-            Reply::OtherReply(u)           => write!(f, "Other reply ({})", u),
+            Reply::OtherReply(u)           => write!(f, "Other reply ({u})"),
             Reply::TtlExpired              => write!(f, "TTL expired"),
         }
     }
@@ -213,6 +210,47 @@ pub enum Address {
 }
 
 impl Address {
+    /// read from a cursor
+    pub fn read_cursor<T: AsRef<[u8]>>(cur: &mut io::Cursor<T>) -> Result<Address, Error> {
+        if cur.remaining() < 2 {
+            return Err(io::Error::new(io::ErrorKind::Other, "invalid buf").into());
+        }
+
+        let atyp = cur.get_u8();
+        match atyp {
+            consts::SOCKS5_ADDR_TYPE_IPV4 => {
+                if cur.remaining() < 4 + 2 {
+                    return Err(io::Error::new(io::ErrorKind::Other, "invalid buf").into());
+                }
+                let addr = Ipv4Addr::from(cur.get_u32());
+                let port = cur.get_u16();
+                Ok(Address::SocketAddress(SocketAddr::V4(SocketAddrV4::new(addr, port))))
+            }
+            consts::SOCKS5_ADDR_TYPE_IPV6 => {
+                if cur.remaining() < 16 + 2 {
+                    return Err(io::Error::new(io::ErrorKind::Other, "invalid buf").into());
+                }
+                let addr = Ipv6Addr::from(cur.get_u128());
+                let port = cur.get_u16();
+                Ok(Address::SocketAddress(SocketAddr::V6(SocketAddrV6::new(
+                    addr, port, 0, 0,
+                ))))
+            }
+            consts::SOCKS5_ADDR_TYPE_DOMAIN_NAME => {
+                let domain_len = cur.get_u8() as usize;
+                if cur.remaining() < domain_len {
+                    return Err(Error::AddressDomainInvalidEncoding);
+                }
+                let mut buf = vec![0u8; domain_len];
+                cur.copy_to_slice(&mut buf);
+                let port = cur.get_u16();
+                let addr = String::from_utf8(buf).map_err(|_| Error::AddressDomainInvalidEncoding)?;
+                Ok(Address::DomainNameAddress(addr, port))
+            }
+            _ => Err(Error::AddressTypeNotSupported(atyp)),
+        }
+    }
+
     /// Parse from a `AsyncRead`
     pub async fn read_from<R>(stream: &mut R) -> Result<Address, Error>
     where
@@ -228,17 +266,14 @@ impl Address {
                 let _ = stream.read_exact(&mut buf).await?;
 
                 let v4addr = Ipv4Addr::new(buf[0], buf[1], buf[2], buf[3]);
-                let port = unsafe {
-                    let raw_port = &buf[4..];
-                    u16::from_be(*(raw_port.as_ptr() as *const _))
-                };
+                let port = u16::from_be_bytes([buf[4], buf[5]]);
                 Ok(Address::SocketAddress(SocketAddr::V4(SocketAddrV4::new(v4addr, port))))
             }
             consts::SOCKS5_ADDR_TYPE_IPV6 => {
-                let mut buf = [0u8; 18];
-                let _ = stream.read_exact(&mut buf).await?;
+                let mut buf = [0u16; 9];
 
-                let buf: &[u16] = unsafe { slice::from_raw_parts(buf.as_ptr() as *const _, 9) };
+                let bytes_buf = unsafe { slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut _, 18) };
+                let _ = stream.read_exact(bytes_buf).await?;
 
                 let v6addr = Ipv6Addr::new(
                     u16::from_be(buf[0]),
@@ -268,7 +303,7 @@ impl Address {
                 let _ = stream.read_exact(&mut raw_addr).await?;
 
                 let raw_port = &raw_addr[length..];
-                let port = unsafe { u16::from_be(*(raw_port.as_ptr() as *const _)) };
+                let port = u16::from_be_bytes([raw_port[0], raw_port[1]]);
 
                 raw_addr.truncate(length);
 
@@ -339,8 +374,8 @@ impl Debug for Address {
     #[inline]
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match *self {
-            Address::SocketAddress(ref addr) => write!(f, "{}", addr),
-            Address::DomainNameAddress(ref addr, ref port) => write!(f, "{}:{}", addr, port),
+            Address::SocketAddress(ref addr) => write!(f, "{addr}"),
+            Address::DomainNameAddress(ref addr, ref port) => write!(f, "{addr}:{port}"),
         }
     }
 }
@@ -349,8 +384,8 @@ impl fmt::Display for Address {
     #[inline]
     fn fmt(&self, f: &mut Formatter) -> fmt::Result {
         match *self {
-            Address::SocketAddress(ref addr) => write!(f, "{}", addr),
-            Address::DomainNameAddress(ref addr, ref port) => write!(f, "{}:{}", addr, port),
+            Address::SocketAddress(ref addr) => write!(f, "{addr}"),
+            Address::DomainNameAddress(ref addr, ref port) => write!(f, "{addr}:{port}"),
         }
     }
 }
@@ -393,6 +428,8 @@ impl Display for AddressError {
         f.write_str("invalid Address")
     }
 }
+
+impl std::error::Error for AddressError {}
 
 impl FromStr for Address {
     type Err = AddressError;
@@ -918,7 +955,7 @@ impl PasswdAuthResponse {
         R: AsyncRead + Unpin,
     {
         let mut buf = [0u8; 2];
-        let _ = r.read_exact(&mut buf);
+        let _ = r.read_exact(&mut buf).await;
 
         if buf[0] != 0x01 {
             return Err(Error::UnsupportedPasswdAuthVersion(buf[0]));

@@ -3,7 +3,6 @@ use std::{
     net::SocketAddr,
 };
 
-use async_trait::async_trait;
 use log::warn;
 use shadowsocks::net::{is_dual_stack_addr, set_tcp_fastopen, AcceptOpts};
 use socket2::Protocol;
@@ -17,26 +16,13 @@ use crate::{
     },
 };
 
-#[async_trait]
 impl TcpListenerRedirExt for TcpListener {
     async fn bind_redir(ty: RedirType, addr: SocketAddr, accept_opts: AcceptOpts) -> io::Result<TcpListener> {
         match ty {
-            #[cfg(any(
-                target_os = "openbsd",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "solaris",
-                target_os = "macos",
-                target_os = "ios",
-            ))]
+            #[cfg(any(target_os = "freebsd", target_os = "openbsd", target_os = "macos", target_os = "ios"))]
             RedirType::PacketFilter => {}
 
-            #[cfg(any(
-                target_os = "freebsd",
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "dragonfly"
-            ))]
+            #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "ios"))]
             RedirType::IpFirewall => {}
 
             _ => {
@@ -65,14 +51,37 @@ impl TcpListenerRedirExt for TcpListener {
 
         let set_dual_stack = is_dual_stack_addr(&addr);
         if set_dual_stack {
-            // Transparent socket shouldn't support dual-stack.
+            // Try to bind dual-stack address
+            match set_ipv6_only(&socket, false) {
+                Ok(..) => {
+                    // bind()
+                    if let Err(err) = socket.bind(addr) {
+                        warn!(
+                            "bind() dual-stack address {} failed, error: {}, fallback to IPV6_V6ONLY=false",
+                            addr, err
+                        );
 
-            if let Err(err) = set_ipv6_only(&socket, true) {
-                warn!("failed to set IPV6_V6ONLY, error: {}", err);
+                        if let Err(err) = set_ipv6_only(&socket, true) {
+                            warn!(
+                                "set IPV6_V6ONLY=true failed, error: {}, bind() to {} directly",
+                                err, addr
+                            );
+                        }
+
+                        socket.bind(addr)?;
+                    }
+                }
+                Err(err) => {
+                    warn!(
+                        "set IPV6_V6ONLY=false failed, error: {}, bind() to {} directly",
+                        err, addr
+                    );
+                    socket.bind(addr)?;
+                }
             }
+        } else {
+            socket.bind(addr)?;
         }
-
-        socket.bind(addr)?;
 
         // mio's default backlog is 1024
         let listener = socket.listen(1024)?;
@@ -88,14 +97,7 @@ impl TcpListenerRedirExt for TcpListener {
 impl TcpStreamRedirExt for TcpStream {
     fn destination_addr(&self, ty: RedirType) -> io::Result<SocketAddr> {
         match ty {
-            #[cfg(any(
-                target_os = "openbsd",
-                target_os = "freebsd",
-                target_os = "netbsd",
-                target_os = "solaris",
-                target_os = "macos",
-                target_os = "ios",
-            ))]
+            #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "ios"))]
             RedirType::PacketFilter => {
                 use crate::local::redir::sys::bsd_pf::PF;
 
@@ -104,12 +106,9 @@ impl TcpStreamRedirExt for TcpStream {
 
                 PF.natlook(&bind_addr, &peer_addr, Protocol::TCP)
             }
-            #[cfg(any(
-                target_os = "freebsd",
-                target_os = "macos",
-                target_os = "ios",
-                target_os = "dragonfly"
-            ))]
+            #[cfg(target_os = "openbsd")] // in OpenBSD, we can get TCP destination address with getsockname()
+            RedirType::PacketFilter => self.local_addr(),
+            #[cfg(any(target_os = "freebsd", target_os = "macos", target_os = "ios"))]
             RedirType::IpFirewall => {
                 // ## IPFW
                 //

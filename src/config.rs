@@ -8,25 +8,29 @@ use std::{
     str::FromStr,
 };
 
-use cfg_if::cfg_if;
 use clap::ArgMatches;
 use directories::ProjectDirs;
 use serde::Deserialize;
 
 /// Default configuration file path
-pub fn get_default_config_path() -> Option<PathBuf> {
+pub fn get_default_config_path(config_file: &str) -> Option<PathBuf> {
     // config.json in the current working directory ($PWD)
+    let config_files = vec![config_file, "config.json"];
     if let Ok(mut path) = env::current_dir() {
-        path.push("config.json");
-
-        if path.exists() {
-            return Some(path);
+        for filename in &config_files {
+            path.push(filename);
+            if path.exists() {
+                return Some(path);
+            }
+            path.pop();
         }
     } else {
         // config.json in the current working directory (relative path)
-        let relative_path = PathBuf::from("config.json");
-        if relative_path.exists() {
-            return Some(relative_path);
+        for filename in &config_files {
+            let relative_path = PathBuf::from(filename);
+            if relative_path.exists() {
+                return Some(relative_path);
+            }
         }
     }
 
@@ -38,10 +42,12 @@ pub fn get_default_config_path() -> Option<PathBuf> {
         // Windows: {FOLDERID_RoamingAppData}/shadowsocks/shadowsocks-rust/config/config.json
 
         let mut config_path = project_dirs.config_dir().to_path_buf();
-        config_path.push("config.json");
-
-        if config_path.exists() {
-            return Some(config_path);
+        for filename in &config_files {
+            config_path.push(filename);
+            if config_path.exists() {
+                return Some(config_path);
+            }
+            config_path.pop();
         }
     }
 
@@ -51,17 +57,22 @@ pub fn get_default_config_path() -> Option<PathBuf> {
     if let Ok(base_directories) = xdg::BaseDirectories::with_prefix("shadowsocks-rust") {
         // $XDG_CONFIG_HOME/shadowsocks-rust/config.json
         // for dir in $XDG_CONFIG_DIRS; $dir/shadowsocks-rust/config.json
-        if let Some(config_path) = base_directories.find_config_file("config.json") {
-            return Some(config_path);
+        for filename in &config_files {
+            if let Some(config_path) = base_directories.find_config_file(filename) {
+                return Some(config_path);
+            }
         }
     }
 
     // UNIX global configuration file
     #[cfg(unix)]
     {
-        let global_config_path = Path::new("/etc/shadowsocks-rust/config.json");
-        if global_config_path.exists() {
-            return Some(global_config_path.to_path_buf());
+        for filename in &config_files {
+            let path_str = "/etc/shadowsocks-rust/".to_owned() + filename;
+            let global_config_path = Path::new(&path_str);
+            if global_config_path.exists() {
+                return Some(global_config_path.to_path_buf());
+            }
         }
     }
 
@@ -161,30 +172,28 @@ impl Config {
     pub fn set_options(&mut self, matches: &ArgMatches) {
         #[cfg(feature = "logging")]
         {
-            let debug_level = matches.occurrences_of("VERBOSE");
+            let debug_level = matches.get_count("VERBOSE");
             if debug_level > 0 {
                 self.log.level = debug_level as u32;
             }
 
-            if matches.is_present("LOG_WITHOUT_TIME") {
+            if matches.get_flag("LOG_WITHOUT_TIME") {
                 self.log.format.without_time = true;
             }
 
-            if let Some(log_config) = matches.value_of("LOG_CONFIG") {
-                self.log.config_path = Some(log_config.into());
+            if let Some(log_config) = matches.get_one::<PathBuf>("LOG_CONFIG").cloned() {
+                self.log.config_path = Some(log_config);
             }
         }
 
         #[cfg(feature = "multi-threaded")]
-        if matches.is_present("SINGLE_THREADED") {
+        if matches.get_flag("SINGLE_THREADED") {
             self.runtime.mode = RuntimeMode::SingleThread;
         }
 
         #[cfg(feature = "multi-threaded")]
-        match matches.value_of_t::<usize>("WORKER_THREADS") {
-            Ok(worker_count) => self.runtime.worker_count = Some(worker_count),
-            Err(ref err) if err.kind() == clap::ErrorKind::ArgumentNotFound => {}
-            Err(err) => err.exit(),
+        if let Some(worker_count) = matches.get_one::<usize>("WORKER_THREADS") {
+            self.runtime.worker_count = Some(*worker_count);
         }
 
         let _ = matches;
@@ -211,25 +220,15 @@ pub struct LogFormatConfig {
 }
 
 /// Runtime mode (Tokio)
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub enum RuntimeMode {
     /// Single-Thread Runtime
+    #[cfg_attr(not(feature = "multi-threaded"), default)]
     SingleThread,
     /// Multi-Thread Runtime
     #[cfg(feature = "multi-threaded")]
+    #[cfg_attr(feature = "multi-threaded", default)]
     MultiThread,
-}
-
-impl Default for RuntimeMode {
-    fn default() -> RuntimeMode {
-        cfg_if! {
-            if #[cfg(feature = "multi-threaded")] {
-                RuntimeMode::MultiThread
-            } else {
-                RuntimeMode::SingleThread
-            }
-        }
-    }
 }
 
 /// Parse `RuntimeMode` from string error
