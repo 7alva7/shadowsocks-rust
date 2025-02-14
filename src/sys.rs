@@ -74,3 +74,76 @@ pub fn adjust_nofile() {
         }
     }
 }
+
+/// setuid(), setgid() for a specific user or uid
+#[cfg(unix)]
+pub fn run_as_user(uname: &str) -> std::io::Result<()> {
+    use log::error;
+    use std::{
+        ffi::{CStr, CString},
+        io::{Error, ErrorKind},
+    };
+
+    unsafe {
+        let pwd = match uname.parse::<libc::uid_t>() {
+            Ok(uid) => {
+                let mut pwd = libc::getpwuid(uid);
+                if pwd.is_null() {
+                    let uname = CString::new(uname).expect("username");
+                    pwd = libc::getpwnam(uname.as_ptr())
+                }
+                pwd
+            }
+            Err(..) => {
+                let uname = CString::new(uname).expect("username");
+                libc::getpwnam(uname.as_ptr())
+            }
+        };
+
+        if pwd.is_null() {
+            return Err(Error::new(ErrorKind::InvalidInput, format!("user {} not found", uname)));
+        }
+
+        let pwd = &*pwd;
+
+        // setgid first, because we may not allowed to do it anymore after setuid
+        if libc::setgid(pwd.pw_gid as libc::gid_t) != 0 {
+            let err = Error::last_os_error();
+
+            error!(
+                "could not change group id to user {:?}'s gid: {}, uid: {}, error: {}",
+                CStr::from_ptr(pwd.pw_name),
+                pwd.pw_gid,
+                pwd.pw_uid,
+                err
+            );
+            return Err(err);
+        }
+
+        if libc::initgroups(pwd.pw_name, pwd.pw_gid as _) != 0 {
+            let err = Error::last_os_error();
+            error!(
+                "could not change supplementary groups to user {:?}'s gid: {}, uid: {}, error: {}",
+                CStr::from_ptr(pwd.pw_name),
+                pwd.pw_gid,
+                pwd.pw_uid,
+                err
+            );
+            return Err(err);
+        }
+
+        if libc::setuid(pwd.pw_uid) != 0 {
+            let err = Error::last_os_error();
+            error!(
+                "could not change user id to user {:?}'s gid: {}, uid: {}, error: {}",
+                CStr::from_ptr(pwd.pw_name),
+                pwd.pw_gid,
+                pwd.pw_uid,
+                err
+            );
+            return Err(err);
+        }
+    }
+
+    Ok(())
+}
